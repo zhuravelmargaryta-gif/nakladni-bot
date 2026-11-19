@@ -11,7 +11,7 @@ from openpyxl.utils import get_column_letter
 
 from . import event_types
 from .cards import status_label, user_display
-from .db import Database, InvoiceFilter
+from .db import Database, InvoiceFilter, is_resolved
 from .parsing import iso_to_date
 
 MONEY = "#,##0.00"
@@ -58,7 +58,7 @@ def build_workbook(db: Database, flt: InvoiceFilter | None) -> tuple[bytes, int]
     wb = Workbook()
 
     inv_headers = [("ID", 7, None), ("Номер", 14, None), ("Дата виписки", 13, DATE), ("Контрагент", 40, None),
-                   ("ЄДРПОУ/ІПН", 14, None), ("Сума з ПДВ", 15, MONEY), ("ПДВ", 13, MONEY), ("Валюта", 8, None),
+                   ("ЄДРПОУ/ІПН", 14, None), ("Проблема", 12, None), ("Сума з ПДВ", 15, MONEY), ("ПДВ", 13, MONEY), ("Валюта", 8, None),
                    ("Поточний статус", 30, None), ("Дата статусу", 13, DATE), ("Надіслано в бот", 17, DATETIME),
                    ("Хто надіслав", 24, None), ("Постачальник", 34, None), ("Код постачальника", 14, None),
                    ("Покупець", 34, None), ("Код покупця", 14, None), ("Статус Odoo", 22, None), ("ID в Odoo", 10, None)]
@@ -66,7 +66,7 @@ def build_workbook(db: Database, flt: InvoiceFilter | None) -> tuple[bytes, int]
     for i in invoices:
         rows.append([
             i["id"], i["number"], iso_to_date(i["invoice_date"]), i["counterparty_name"], i["counterparty_code"],
-            i["total"], i["vat"], i["currency"] or "UAH",
+            "вирішена" if is_resolved(i) else "відкрита", i["total"], i["vat"], i["currency"] or "UAH",
             status_label(i["status"]) if i.get("status") else "Без подій", iso_to_date(i.get("status_date")),
             _dt(i["sent_at"]), user_display(i["user_name"], i["user_username"]),
             i["supplier_name"], i["supplier_code"], i["buyer_name"], i["buyer_code"],
@@ -75,7 +75,7 @@ def build_workbook(db: Database, flt: InvoiceFilter | None) -> tuple[bytes, int]
     ws = _sheet(wb, "Накладні", inv_headers, rows, first=True)
     total_row = len(rows) + 2
     ws.cell(total_row, 2, "РАЗОМ").font = Font(bold=True)
-    for col, key in ((6, "total"), (7, "vat")):
+    for col, key in ((7, "total"), (8, "vat")):
         c = ws.cell(total_row, col, round(sum(i[key] or 0 for i in invoices), 2))
         c.number_format = MONEY
         c.font = Font(bold=True)

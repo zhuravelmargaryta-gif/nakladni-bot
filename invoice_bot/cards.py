@@ -6,7 +6,9 @@ from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from . import event_types
-from .db import ACTIONS, EDITABLE_FIELDS, NO_STATUS, InvoiceFilter
+from datetime import date
+
+from .db import ACTIONS, EDITABLE_FIELDS, NO_STATUS, InvoiceFilter, is_resolved, problem_open_since
 from .parsing import (esc, fmt_date, fmt_datetime, fmt_money, fmt_qty, fmt_short_date, iso_to_date,
                       truncate)
 
@@ -35,8 +37,11 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 HELP_TEXT = (
     "ℹ️ <b>Як користуватися ботом</b>\n\n"
-    "📷 <b>Надішліть фото накладної</b> (можна файлом без стиснення або PDF) — бот розпізнає реквізити "
-    "і збереже їх.\n\n"
+    "📷 <b>Надішліть фото проблемної накладної</b> (можна файлом без стиснення або PDF) — бот розпізнає "
+    "реквізити і збереже її як 🔴 <b>відкриту проблему</b>.\n\n"
+    "✅ Коли проблему вирішено — натисніть у картці «✅ Вирішено» (можна написати, як вирішили, і додати фото). "
+    "Передумали — «🔓 Відкрити знову».\n"
+    "У списку над накладними є перемикач: 🔴 Відкриті · 🟢 Вирішені · Усі.\n\n"
     "📋 <b>Меню внизу</b> — перегляд, фільтри за контрагентом, періодом і статусом, підсумки, Excel.\n"
     "Фільтри поєднуються між собою і зберігаються саме для вас. ♻️ — скинути.\n\n"
     "🔎 <b>Пошук</b> — просто напишіть у чат номер накладної, назву контрагента або ЄДРПОУ.\n"
@@ -85,6 +90,23 @@ def odoo_line(inv: dict, odoo_url: str = "") -> str:
     return "➖ не відправлено"
 
 
+def problem_line(inv: dict, events: list[dict], today: date | None = None) -> str:
+    if is_resolved(inv):
+        ev = next((e for e in reversed(events) if e["event_type"] == "resolved"), None)
+        s = f"🟢 <b>Проблему вирішено</b> · {fmt_date(inv.get('problem_date'))}"
+        if ev:
+            s += f" — {esc(ev.get('user_name') or '')}"
+            if ev.get("comment"):
+                s += f"\n      «{esc(truncate(ev['comment'], 200))}»"
+        return s
+    since = iso_to_date(problem_open_since(inv))
+    days = ((today or date.today()) - since).days if since else None
+    s = "🔴 <b>Проблема відкрита</b>"
+    if days is not None:
+        s += f" · {days} дн. (з {fmt_date(since)})" if days > 0 else " · з сьогодні"
+    return s
+
+
 def event_line(ev: dict, currency: str = "UAH", full: bool = False) -> str:
     et = event_types.get(ev["event_type"])
     parts = [f"{fmt_date(ev['event_date']) if full else fmt_short_date(ev['event_date'])} {et.label}"]
@@ -112,6 +134,8 @@ def invoice_card(inv: dict, items: list[dict], events: list[dict], *, header: st
     if inv.get("deleted_at"):
         lines.append(f"🗑 <b>Видалено</b> {fmt_datetime(inv['deleted_at'])} — {esc(inv.get('deleted_by') or '')}")
     lines.append(f"🧾 <b>Накладна № {esc(inv.get('number') or '—')}</b>  (запис #{inv['id']})")
+    if not inv.get("deleted_at"):
+        lines.append(problem_line(inv, events))
     lines.append(f"📅 Дата виписки: {fmt_date(inv.get('invoice_date'))}")
     lines.append(f"📨 Надіслано в бот: {fmt_datetime(inv.get('sent_at'))} — "
                  f"{esc(user_display(inv.get('user_name'), inv.get('user_username')))}")
@@ -169,7 +193,12 @@ def invoice_keyboard(inv: dict, odoo_enabled: bool = False) -> InlineKeyboardMar
     if inv.get("deleted_at"):
         return InlineKeyboardMarkup([[Btn("↩️ Відновити", callback_data=f"rs:{i}"),
                                       Btn("🕓 Історія змін", callback_data=f"hi:{i}")]])
+    if is_resolved(inv):
+        problem_btn = Btn("🔓 Відкрити знову", callback_data=f"ro:{i}")
+    else:
+        problem_btn = Btn("✅ Вирішено", callback_data=f"rv:{i}")
     rows = [
+        [problem_btn],
         [Btn("🖼 Фото", callback_data=f"ph:{i}"), Btn("✏️ Редагувати", callback_data=f"ed:{i}")],
         [Btn("➕ Подія", callback_data=f"ev:{i}"), Btn("📌 Рух накладної", callback_data=f"mv:{i}")],
         [Btn("🕓 Історія змін", callback_data=f"hi:{i}"), Btn("🗑 Видалити", callback_data=f"dl:{i}")],
@@ -210,7 +239,7 @@ def confirm_keyboard(yes_data: str, yes_text: str = "🗑 Так, видалит
 
 def event_type_keyboard(invoice_id: int) -> InlineKeyboardMarkup:
     rows, row = [], []
-    for et in event_types.EVENT_TYPES:
+    for et in (e for e in event_types.EVENT_TYPES if e.in_menu):
         row.append(Btn(et.label, callback_data=f"et:{invoice_id}:{et.key}"))
         if len(row) == 2:
             rows.append(row)
@@ -331,23 +360,41 @@ def filter_description(flt: InvoiceFilter) -> str:
             parts.append(f"📅 {fmt_date(flt.date_from)} – {fmt_date(flt.date_to)}")
     if flt.status:
         parts.append(f"📌 {status_label(flt.status)}")
+    if flt.problems == "open":
+        parts.append("🔴 Відкриті")
+    elif flt.problems == "resolved":
+        parts.append("🟢 Вирішені")
     if flt.query:
         parts.append(f"🔎 «{esc(truncate(flt.query, 40))}»")
     return "🔎 Фільтр: " + " · ".join(parts)
 
 
 def list_button_text(inv: dict) -> str:
-    return (f"{status_emoji(inv.get('status'))} {fmt_date(inv.get('invoice_date'))} · "
+    mark = "🟢" if is_resolved(inv) else "🔴"
+    status = f"{status_emoji(inv['status'])} " if inv.get("status") else ""
+    return (f"{mark}{status}{fmt_date(inv.get('invoice_date'))} · "
             f"№{truncate(inv.get('number') or '—', 15)} · {truncate(inv.get('counterparty_name') or '—', 24)} · "
             f"{fmt_money(inv.get('total'), inv.get('currency'))}")
 
 
-def list_view(rows: list[dict], page: int, total: int, flt: InvoiceFilter) -> tuple[str, InlineKeyboardMarkup]:
+def problem_toggle(counts: dict | None, current: str) -> list[Btn]:
+    counts = counts or {}
+
+    def b(key: str, title: str, n_key: str) -> Btn:
+        mark = "• " if current == key else ""
+        n = counts.get(n_key)
+        return Btn(f"{mark}{title}" + (f" ({n})" if n is not None else ""), callback_data=f"pb:{key or '*'}")
+    return [b("open", "🔴 Відкриті", "open"), b("resolved", "🟢 Вирішені", "resolved"), b("", "Усі", "all")]
+
+
+def list_view(rows: list[dict], page: int, total: int, flt: InvoiceFilter,
+              counts: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
     pages = max(1, -(-total // PAGE_SIZE))
     text = filter_description(flt) + f"\n\n📋 Знайдено накладних: <b>{total}</b>"
     if not total:
         text += "\n\nНічого не знайдено. Спробуйте змінити фільтр ♻️ або надішліть фото накладної."
-    kb = [[Btn(list_button_text(r), callback_data=f"inv:{r['id']}")] for r in rows]
+    kb = [problem_toggle(counts, flt.problems)]
+    kb += [[Btn(list_button_text(r), callback_data=f"inv:{r['id']}")] for r in rows]
     if pages > 1:
         kb.append([
             Btn("◀️", callback_data=f"lp:{page - 1}" if page > 0 else "noop"),
@@ -412,7 +459,7 @@ SUMMARY_EVENT_KEYS = ["paid", "partial_paid", "refund", "goods_return", "goods_l
 
 def summary_view(s: dict, flt: InvoiceFilter) -> str:
     lines = [filter_description(flt), "", "📊 <b>Підсумки</b>",
-             f"🧾 Накладних: <b>{s['count']}</b>",
+             f"🧾 Накладних: <b>{s['count']}</b>  (🔴 відкритих: {s['open']} · 🟢 вирішених: {s['resolved']})",
              f"💰 Сума з ПДВ: <b>{fmt_money(s['total'])}</b>",
              f"🧮 ПДВ: {fmt_money(s['vat'])}",
              f"📄 Без ПДВ: {fmt_money(s['net'])}"]
@@ -428,3 +475,23 @@ def summary_view(s: dict, flt: InvoiceFilter) -> str:
     if ev_lines:
         lines += ["", "📌 <b>За подіями руху:</b>"] + ev_lines
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- нагадування
+
+
+def reminder_view(rows: list[dict], min_days: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    head = f"⏰ <b>Нагадування: невирішені проблеми ({len(rows)})</b>"
+    if min_days:
+        head += f"\nВідкриті {min_days}+ дн."
+    lines = [head, ""]
+    for r in rows:
+        lines.append(f"🔴 #{r['id']} · №{esc(r.get('number') or '—')} · "
+                     f"{esc(truncate(r.get('counterparty_name') or '—', 40))} · "
+                     f"{fmt_money(r.get('total'), r.get('currency'))} — <b>{r['days']} дн.</b>")
+    lines += ["", "Щоб відкрити накладну, напишіть її номер запису, напр. <code>#12</code>."]
+    text = _fit_tail(lines, keep_head=2) if len("\n".join(lines)) > TG_LIMIT else "\n".join(lines)
+    kb = [[Btn(truncate(f"#{r['id']} · {r.get('counterparty_name') or '—'} · {r['days']} дн.", 60),
+               callback_data=f"inv:{r['id']}")] for r in rows[:10]]
+    kb.append([Btn("🔴 Усі відкриті", callback_data="pbl:open")])
+    return text, InlineKeyboardMarkup(kb)

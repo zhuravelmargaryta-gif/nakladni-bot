@@ -17,7 +17,7 @@ from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler,
 
 from . import cards, event_types, parsing
 from .config import Config
-from .db import EDITABLE_FIELDS, Database, InvoiceFilter, now_str
+from .db import EDITABLE_FIELDS, Database, InvoiceFilter, is_resolved, now_str
 from .export import build_workbook
 from .odoo import Attachment, OdooError, OdooSync
 from .recognition import RecognitionError, normalize
@@ -51,7 +51,8 @@ class InvoiceBot:
 
     def build(self) -> Application:
         defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        app = ApplicationBuilder().token(self.cfg.bot_token).defaults(defaults).concurrent_updates(True).build()
+        app = (ApplicationBuilder().token(self.cfg.bot_token).defaults(defaults).concurrent_updates(True)
+               .post_init(self._post_init).post_stop(self._post_stop).build())
         app.add_handler(CommandHandler("myid", self.cmd_myid))
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
@@ -310,7 +311,8 @@ class InvoiceBot:
             "hi": self._cb_history, "dl": self._cb_delete_ask, "dly": self._cb_delete, "rs": self._cb_restore,
             "os": self._cb_odoo, "lp": self._cb_list_page, "cpl": self._cb_cp_page, "cp": self._cb_cp_select,
             "cps": self._cb_cp_search, "cpa": self._cb_cp_all, "pr": self._cb_period, "st": self._cb_status,
-            "sum": self._cb_summary, "xls": self._cb_excel, "rst": self._cb_reset, "cx": self._cb_cancel,
+            "rv": self._cb_resolve, "ro": self._cb_reopen, "pb": self._cb_problem_filter,
+            "pbl": self._cb_problem_list, "sum": self._cb_summary, "xls": self._cb_excel, "rst": self._cb_reset, "cx": self._cb_cancel,
         }.get(cmd)
         if not handler:
             await q.answer()
@@ -465,6 +467,11 @@ class InvoiceBot:
         elif st["step"] == "date":
             text = title + "📅 Дата події? Оберіть або введіть у форматі ДД.ММ.РРРР."
             kb = cards.cancel_keyboard([Btn("Сьогодні", callback_data="evd:0"), Btn("Вчора", callback_data="evd:1")])
+        elif st["type"] == event_types.RESOLVED:
+            text = ("✅ <b>Позначаю проблему вирішеною</b>\n\n"
+                    "💬 Напишіть, як її вирішили (напр. «довезли товар», «повернули кошти»), та/або надішліть "
+                    "фото чи документ. Або натисніть «Зберегти без коментаря».")
+            kb = cards.cancel_keyboard([Btn("💾 Зберегти без коментаря", callback_data="evn")])
         else:
             text = title + ("💬 Напишіть коментар (напр. номер ТТН, причину) та/або надішліть фото чи документ "
                             "(підпис до фото = коментар).")
@@ -536,7 +543,8 @@ class InvoiceBot:
                 note += f"\n{st['comment']}"
             note += f"\n(Telegram-бот, {user['name']})"
             self._background(self._odoo_note(inv["odoo_id"], note))
-        await self._show_card(st["invoice_id"], header="✅ Подію додано.", chat_id=update.effective_chat.id)
+        header = ("🟢 Проблему позначено вирішеною." if st["type"] == event_types.RESOLVED else "✅ Подію додано.")
+        await self._show_card(st["invoice_id"], header=header, chat_id=update.effective_chat.id)
 
     async def _cb_movement(self, update, ctx, arg, user):
         inv = await self._get_inv_or_alert(update, arg)
@@ -729,6 +737,88 @@ class InvoiceBot:
         self.db.save_filter(user["id"], InvoiceFilter())
         await self._show_list(update, ctx, 0, edit=update.callback_query.message)
 
+    # ---- стан проблеми
+    async def _cb_resolve(self, update, ctx, arg, user):
+        inv = await self._get_inv_or_alert(update, arg)
+        if not inv:
+            return
+        if is_resolved(inv):
+            return await update.callback_query.answer("Проблему вже позначено вирішеною", show_alert=True)
+        await update.callback_query.answer()
+        ctx.user_data["state"] = {"mode": "event", "invoice_id": inv["id"], "type": event_types.RESOLVED,
+                                  "step": "comment", "date": date.today().isoformat()}
+        await ctx.bot.send_message(update.effective_chat.id,
+                                   f"🧾 Накладна № {parsing.esc(inv['number'] or '—')} (#{inv['id']})")
+        await self._event_prompt(update, ctx)
+
+    async def _cb_reopen(self, update, ctx, arg, user):
+        inv = await self._get_inv_or_alert(update, arg)
+        if not inv:
+            return
+        if not is_resolved(inv):
+            return await update.callback_query.answer("Проблема й так відкрита", show_alert=True)
+        await update.callback_query.answer("🔓 Проблему відкрито знову")
+        self.db.add_event(inv["id"], event_types.REOPENED, date.today().isoformat(), user)
+        if self.odoo and inv.get("odoo_id"):
+            self._background(self._odoo_note(inv["odoo_id"], f"🔓 Проблему відкрито знову ({user['name']})"))
+        await self._show_card(inv["id"], header="🔓 Проблему відкрито знову.", edit=update.callback_query.message)
+
+    async def _cb_problem_filter(self, update, ctx, arg, user):
+        await update.callback_query.answer()
+        flt = self.db.get_filter(user["id"])
+        flt.problems = arg if arg in ("open", "resolved") else ""
+        self.db.save_filter(user["id"], flt)
+        await self._show_list(update, ctx, 0, edit=update.callback_query.message)
+
+    async def _cb_problem_list(self, update, ctx, arg, user):
+        """З нагадування: показати всі відкриті (решту фільтрів скидаємо)."""
+        await update.callback_query.answer()
+        self.db.save_filter(user["id"], InvoiceFilter(problems="open"))
+        await self._show_list(update, ctx, 0)
+
+    # ---- нагадування
+    async def _post_init(self, app: Application):
+        self._bot = app.bot
+        if self.cfg.reminder_clock and self.cfg.reminder_recipients:
+            self._reminder_task = asyncio.create_task(self._reminder_loop())
+            log.info("Нагадування про проблеми: щодня о %s для %s користувачів", self.cfg.reminder_time,
+                     len(self.cfg.reminder_recipients))
+        elif self.cfg.reminder_clock:
+            log.warning("Нагадування вимкнено: не вказано ADMIN_IDS / ALLOWED_USERS / REMINDER_USER_IDS")
+
+    async def _post_stop(self, app: Application):
+        task = getattr(self, "_reminder_task", None)
+        if task:
+            task.cancel()
+
+    async def _reminder_loop(self):
+        h, m = self.cfg.reminder_clock
+        while True:
+            now = datetime.now()
+            nxt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if nxt <= now:
+                nxt += timedelta(days=1)
+            await asyncio.sleep((nxt - now).total_seconds())
+            try:
+                await self.send_reminders()
+            except Exception:
+                log.exception("Помилка надсилання нагадувань")
+
+    async def send_reminders(self, today: date | None = None) -> int:
+        """Надіслати список відкритих проблем. Повертає кількість отримувачів, яким вдалося надіслати."""
+        rows = self.db.open_problems(today, self.cfg.reminder_min_days)
+        if not rows:
+            return 0
+        text, kb = cards.reminder_view(rows, self.cfg.reminder_min_days)
+        sent = 0
+        for uid in sorted(self.cfg.reminder_recipients):
+            try:
+                await self._bot.send_message(uid, text, reply_markup=kb)
+                sent += 1
+            except Exception as exc:  # користувач не натискав Start або заблокував бота
+                log.warning("Нагадування для %s не надіслано: %s", uid, exc)
+        return sent
+
     async def _cb_cancel(self, update, ctx, arg, user):
         ctx.user_data.pop("state", None)
         await update.callback_query.answer("Скасовано")
@@ -752,7 +842,7 @@ class InvoiceBot:
         pages = max(1, -(-total // cards.PAGE_SIZE))
         page = min(max(0, page), pages - 1)
         rows = self.db.list_invoices(flt, page * cards.PAGE_SIZE, cards.PAGE_SIZE)
-        text, kb = cards.list_view(rows, page, total, flt)
+        text, kb = cards.list_view(rows, page, total, flt, self.db.problem_counts(flt))
         if edit:
             await self._edit(edit, text, reply_markup=kb)
         else:

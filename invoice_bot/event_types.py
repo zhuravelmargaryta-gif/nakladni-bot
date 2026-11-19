@@ -15,6 +15,7 @@ class EventType:
     emoji: str
     title: str
     has_amount: bool
+    in_menu: bool = True    # False — подія ставиться окремою кнопкою в картці, а не через «➕ Подія»
 
     @property
     def label(self) -> str:
@@ -36,12 +37,18 @@ EVENT_TYPES: list[EventType] = [
     EventType("claim", "⚠️", "Претензія / спір", True),
     EventType("closed", "🏁", "Закрито", False),
     EventType("other", "📝", "Інше", True),
+    # Стан проблеми: кожна накладна — відкрита проблема, доки її не позначать вирішеною
+    EventType("resolved", "✅", "Проблему вирішено", False, in_menu=False),
+    EventType("reopened", "🔓", "Проблему відкрито знову", False, in_menu=False),
 ]
 
 BY_KEY: dict[str, EventType] = {e.key: e for e in EVENT_TYPES}
+
+RESOLVED = "resolved"
+REOPENED = "reopened"
 
 UNKNOWN = EventType("unknown", "❔", "Невідома подія", True)
 
 
 def get(key: str | None) -> EventType:
-    return BY_KEY.get(key or "", UNKNOWN if key else UNKNOWN)
+    return BY_KEY.get(key or "", UNKNOWN)

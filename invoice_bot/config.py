@@ -49,6 +49,22 @@ class Config:
     odoo_purchase_tax_id: int | None = None
     odoo_journal_id: int | None = None
     odoo_expense_account_id: int | None = None
+    reminder_time: str = "09:00"            # ГГ:ХХ або '' — вимкнено
+    reminder_min_days: int = 1              # нагадувати про проблеми, відкриті щонайменше N днів
+    reminder_user_ids: frozenset[int] = field(default_factory=frozenset)
+
+    @property
+    def reminder_recipients(self) -> frozenset[int]:
+        """Кому слати нагадування: REMINDER_USER_IDS → ADMIN_IDS → ALLOWED_USERS."""
+        return self.reminder_user_ids or self.admin_ids or self.allowed_users
+
+    @property
+    def reminder_clock(self) -> tuple[int, int] | None:
+        try:
+            h, m = (int(x) for x in self.reminder_time.strip().split(":"))
+            return (h, m) if 0 <= h < 24 and 0 <= m < 60 else None
+        except (ValueError, AttributeError):
+            return None
 
     @property
     def odoo_enabled(self) -> bool:
@@ -84,4 +100,7 @@ class Config:
             odoo_purchase_tax_id=_int_or_none(g("ODOO_PURCHASE_TAX_ID")),
             odoo_journal_id=_int_or_none(g("ODOO_JOURNAL_ID")),
             odoo_expense_account_id=_int_or_none(g("ODOO_EXPENSE_ACCOUNT_ID")),
+            reminder_time=(g("REMINDER_TIME") if g("REMINDER_TIME") is not None else "09:00").strip(),
+            reminder_min_days=_int_or_none(g("REMINDER_MIN_DAYS")) if _int_or_none(g("REMINDER_MIN_DAYS")) is not None else 1,
+            reminder_user_ids=_ids(g("REMINDER_USER_IDS")),
         )

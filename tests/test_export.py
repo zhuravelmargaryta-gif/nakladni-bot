@@ -26,12 +26,13 @@ def test_excel_matches_summary(db):
     assert {r[0] for r in rows} == {a, b}
     first = rows[0]
     assert isinstance(first[2], datetime) and first[2].date() == date(2026, 10, 5)
-    assert isinstance(first[5], (int, float)) and not isinstance(first[5], bool)
-    assert isinstance(first[10], datetime)
+    assert isinstance(first[6], (int, float)) and not isinstance(first[6], bool)
+    assert {r[5] for r in rows} == {"відкрита"}
+    assert isinstance(first[11], datetime)
     total_row = list(ws.iter_rows(min_row=4, max_row=4, values_only=True))[0]
     s = db.summary(InvoiceFilter())
-    assert total_row[1] == "РАЗОМ" and total_row[5] == s["total"] and total_row[6] == s["vat"]
-    assert ws.cell(2, 6).number_format == "#,##0.00" and ws.cell(2, 3).number_format == "DD.MM.YYYY"
+    assert total_row[1] == "РАЗОМ" and total_row[6] == s["total"] and total_row[7] == s["vat"]
+    assert ws.cell(2, 7).number_format == "#,##0.00" and ws.cell(2, 3).number_format == "DD.MM.YYYY"
 
     items = list(wb["Товари"].iter_rows(min_row=2, values_only=True))
     assert len(items) == 4 and items[0][5] in ("Цукор", "Борошно")

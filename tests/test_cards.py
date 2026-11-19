@@ -57,7 +57,8 @@ def test_list_view(db):
     assert "🏢 Ромашка" in text and "📅 Цей місяць" in text and "📌 📤 Відправлено контрагенту" in text
     calls = _all_callbacks(kb)
     assert sum(c.startswith("inv:") for c in calls) == 8 and "lp:1" in calls
-    first = kb.inline_keyboard[0][0].text
+    assert [b.callback_data for b in kb.inline_keyboard[0]] == ["pb:open", "pb:resolved", "pb:*"]
+    first = kb.inline_keyboard[1][0].text
     assert "05.10.2026 · №19 · ТОВ \"Ромашка\" · 1 200,00 грн" in first
     assert cards.filter_description(InvoiceFilter()) == "🔎 Фільтр: усі накладні"
 

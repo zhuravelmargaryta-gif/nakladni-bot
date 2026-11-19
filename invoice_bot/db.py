@@ -118,7 +118,7 @@ ACTIONS = {
 
 STATUS_SQL = (
     "(SELECT e.event_type FROM invoice_events e WHERE e.invoice_id = i.id AND e.deleted_at IS NULL "
-    "ORDER BY e.event_date DESC, e.id DESC LIMIT 1)"
+    "AND e.event_type NOT IN ('resolved', 'reopened') ORDER BY e.event_date DESC, e.id DESC LIMIT 1)"
 )
 STATUS_DATE_SQL = STATUS_SQL.replace("SELECT e.event_type", "SELECT e.event_date")
 CP_KEY_SQL = (
@@ -126,6 +126,30 @@ CP_KEY_SQL = (
     "ELSE 'name:' || ulower(TRIM(COALESCE(i.counterparty_name, ''))) END"
 )
 NO_STATUS = "none"
+
+
+# Стан проблеми = остання з подій «вирішено» / «відкрито знову». Немає жодної → проблема відкрита.
+PROBLEM_LAST_SQL = (
+    "(SELECT e.{col} FROM invoice_events e WHERE e.invoice_id = i.id AND e.deleted_at IS NULL "
+    "AND e.event_type IN ('resolved', 'reopened') ORDER BY e.event_date DESC, e.id DESC LIMIT 1)"
+)
+RESOLVED_SQL = f"COALESCE({PROBLEM_LAST_SQL.format(col='event_type')}, '') = 'resolved'"
+SELECT_EXTRA = (
+    f"{STATUS_SQL} AS status, {STATUS_DATE_SQL} AS status_date, "
+    f"{PROBLEM_LAST_SQL.format(col='event_type')} AS problem_last, "
+    f"{PROBLEM_LAST_SQL.format(col='event_date')} AS problem_date"
+)
+
+
+def is_resolved(inv: dict) -> bool:
+    return inv.get("problem_last") == "resolved"
+
+
+def problem_open_since(inv: dict) -> str:
+    """Дата, з якої проблема відкрита: остання «відкрито знову» або дата надсилання в бот."""
+    if inv.get("problem_last") == "reopened" and inv.get("problem_date"):
+        return inv["problem_date"]
+    return (inv.get("sent_at") or "")[:10] or inv.get("invoice_date") or ""
 
 
 def now_str() -> str:
@@ -155,10 +179,11 @@ class InvoiceFilter:
     period_label: str = ""
     status: str = ""         # ключ події, 'none' (без подій) або ''
     query: str = ""
+    problems: str = ""       # 'open' — відкриті проблеми, 'resolved' — вирішені, '' — усі
 
     @property
     def is_empty(self) -> bool:
-        return not any([self.cp_key, self.date_from, self.date_to, self.status, self.query])
+        return not any([self.cp_key, self.date_from, self.date_to, self.status, self.query, self.problems])
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -200,6 +225,10 @@ def build_where(flt: InvoiceFilter | None) -> tuple[str, list[Any]]:
     elif flt.status:
         clauses.append(f"{STATUS_SQL} = ?")
         params.append(flt.status)
+    if flt.problems == "open":
+        clauses.append(f"NOT ({RESOLVED_SQL})")
+    elif flt.problems == "resolved":
+        clauses.append(RESOLVED_SQL)
     if flt.query:
         q = flt.query.strip().casefold()
         q_digits = parsing.digits_only(q)
@@ -316,7 +345,7 @@ class Database:
 
     def get_invoice(self, invoice_id: int) -> dict | None:
         return self._one(
-            f"SELECT i.*, {STATUS_SQL} AS status, {STATUS_DATE_SQL} AS status_date FROM invoices i WHERE i.id = ?",
+            f"SELECT i.*, {SELECT_EXTRA} FROM invoices i WHERE i.id = ?",
             (invoice_id,),
         )
 
@@ -372,7 +401,7 @@ class Database:
     # -- списки та фільтри
     def list_invoices(self, flt: InvoiceFilter | None = None, offset: int = 0, limit: int | None = None) -> list[dict]:
         where, params = build_where(flt)
-        sql = (f"SELECT i.*, {STATUS_SQL} AS status, {STATUS_DATE_SQL} AS status_date FROM invoices i "
+        sql = (f"SELECT i.*, {SELECT_EXTRA} FROM invoices i "
                f"WHERE {where} {ORDER_SQL}")
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
@@ -433,7 +462,11 @@ class Database:
             f"GROUP BY e.event_type", params)
         total = round(tot["total"] or 0, 2)
         vat = round(tot["vat"] or 0, 2)
+        resolved_n = self._one(f"SELECT COUNT(*) AS n FROM invoices i WHERE {where} AND {RESOLVED_SQL}",
+                               params)["n"]
         return {
+            "resolved": resolved_n,
+            "open": (tot["n"] or 0) - resolved_n,
             "count": tot["n"] or 0,
             "total": total,
             "vat": vat,
@@ -488,6 +521,26 @@ class Database:
         self.log(ev["invoice_id"], "event_deleted", user, ev["event_type"],
                  _event_summary(ev["event_type"], ev["event_date"], ev["amount"]), "")
         return ev
+
+    def problem_counts(self, flt: InvoiceFilter | None = None) -> dict[str, int]:
+        """Скільки відкритих / вирішених за поточним фільтром (без урахування самого перемикача)."""
+        where, params = build_where((flt or InvoiceFilter()).without("problems"))
+        row = self._one(f"SELECT COUNT(*) AS n, SUM(CASE WHEN {RESOLVED_SQL} THEN 1 ELSE 0 END) AS r "
+                        f"FROM invoices i WHERE {where}", params)
+        resolved = row["r"] or 0
+        return {"open": (row["n"] or 0) - resolved, "resolved": resolved, "all": row["n"] or 0}
+
+    def open_problems(self, today: date | None = None, min_days: int = 0) -> list[dict]:
+        """Відкриті проблеми, відкриті щонайменше min_days днів (+ поля since, days). Найстаріші — першими."""
+        today = today or date.today()
+        out = []
+        for inv in self.list_invoices(InvoiceFilter(problems="open")):
+            since = parsing.iso_to_date(problem_open_since(inv)) or today
+            inv["since"], inv["days"] = since.isoformat(), (today - since).days
+            if inv["days"] >= min_days:
+                out.append(inv)
+        out.sort(key=lambda r: (-r["days"], r["id"]))
+        return out
 
     # -- Odoo
     def set_odoo(self, invoice_id: int, status: str, odoo_id: int | None = None, error: str = "") -> None:
